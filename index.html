@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+	<title>MilkyWayAtlas</title>
+	<style>
+		* { margin: 0; padding: 0; }
+		html, body { 
+			width: 100%; 
+			height: 100%; 
+			overflow: hidden;
+			background: #000;
+		}
+		#canvas {
+			width: 100%;
+			height: 100%;
+			display: block;
+			background-color: black;
+		}
+		#loading {
+			position: absolute;
+			top: 50%;
+			left: 50%;
+			transform: translate(-50%, -50%);
+			color: #fff;
+			font-family: sans-serif;
+			text-align: center;
+			opacity: 1;
+			visibility: visible;
+			transition: opacity 4.0s ease, visibility 0s linear 4.0s;
+		}
+		#loading.is-hidden {
+			opacity: 0;
+			visibility: hidden;
+			pointer-events: none;
+		}
+		#progress-bar-bg {
+			width: 300px;
+			height: 8px;
+			background: #333;
+			border-radius: 4px;
+			margin-top: 10px;
+			overflow: hidden;
+		}
+		#progress-bar {
+			position: relative;
+			width: 0%;
+			height: 100%;
+			background: #2C6F9B;
+			border-radius: 4px;
+			transition: width 0.2s;
+		}
+		#loading-indicator {
+			position: absolute;
+			top: 0;
+			left: 0;
+			width: 28px;
+			height: 100%;
+			border-radius: 4px;
+			background: #fff;
+			opacity: 0;
+			transform: translate3d(0, 0, 0);
+			will-change: transform;
+		}
+		#progress-bar.is-loading #loading-indicator {
+			opacity: 1;
+			animation: loading-sweep 1.4s cubic-bezier(.37, 0, .63, 1) infinite alternate;
+		}
+		@keyframes loading-sweep {
+			from { transform: translate3d(0, 0, 0); }
+			to { transform: translate3d(272px, 0, 0); }
+		}
+		#progress-bytes {
+			margin-top: 5px;
+			font-size: 12px;
+			color: #888;
+		}
+		#build-date {
+			margin-top: 15px;
+			font-size: 11px;
+			color: #555;
+		}
+	</style>
+</head>
+<body>
+	<div id="loading">
+		<div id="progress-text">Loading...</div>
+		<div id="progress-bar-bg"><div id="progress-bar"><div id="loading-indicator"></div></div></div>
+		<div id="progress-bytes"></div>
+		<div id="build-date"></div>
+	</div>
+	<canvas id="canvas" tabindex="0"></canvas>
+
+	<script type='text/javascript'>
+
+		function formatBytes(bytes) {
+			if( bytes < 1024 ) return bytes + ' B';
+			if( bytes < 1024 * 1024 ) return (bytes / 1024).toFixed(1) + ' KB';
+			return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+		}
+
+		var Module = {};
+		var BUILT_WASM_SIZE = 13192419;
+		Module.onEngineTickStarted = function() {
+			document.getElementById('progress-bar').classList.remove('is-loading');
+			document.getElementById('loading').classList.add('is-hidden');
+		};
+
+		// Fetch WASM with progress tracking (collects chunks, avoids Content-Length issues)
+		fetch('MWAtlas.wasm')
+		.then(function(response) {
+			// Extract build date from Last-Modified header
+			var lastModified = response.headers.get('Last-Modified');
+			var infoText = '';
+			if( lastModified ) {
+				var buildDate = new Date(lastModified);
+				infoText = 'Build: ' + buildDate.toLocaleString();
+			}
+			if( infoText ) {
+				document.getElementById('build-date').innerText = infoText;
+			}
+
+			var contentLength = response.headers.get('Content-Length');
+			var contentEncoding = response.headers.get('Content-Encoding');
+			var sizeInBytes = BUILT_WASM_SIZE || (!contentEncoding || contentEncoding === 'identity'
+				? parseInt(contentLength, 10) || 0 : 0);
+			if( !sizeInBytes ) document.getElementById('progress-bar').classList.add('is-loading');
+
+			var loaded = 0;
+			var reader = response.body.getReader();
+			var chunks = [];
+
+			function read() {
+				return reader.read().then(function(result) {
+					if( result.done ) {
+						document.getElementById('progress-text').innerText = 'Initializing...';
+						var progressBar = document.getElementById('progress-bar');
+						progressBar.style.width = '100%';
+						progressBar.classList.add('is-loading');
+						document.getElementById('progress-bytes').innerText = '';
+						// Combine all chunks into a single ArrayBuffer
+						var blob = new Blob(chunks);
+						return blob.arrayBuffer();
+					}
+					chunks.push(result.value);
+					loaded += result.value.length;
+
+					if( sizeInBytes ) {
+						var pct = Math.min(99, (loaded / sizeInBytes * 100)).toFixed(1);
+						document.getElementById('progress-bar').style.width = pct + '%';
+						document.getElementById('progress-text').innerText = 'Downloading... ' + pct + '%';
+					} else {
+						document.getElementById('progress-text').innerText = 'Downloading...';
+					}
+					document.getElementById('progress-bytes').innerText = formatBytes(loaded)
+						+ (sizeInBytes ? ' / ' + formatBytes(sizeInBytes) : '');
+
+					return read();
+				});
+			}
+			return read();
+		})
+		.then(function(buffer) {
+			Module.canvas = document.getElementById("canvas");
+			Module.wasmBinary = buffer;
+
+			// Firefox WebGPU fix: Emscripten passes HEAPU32 (entire WASM heap) as dynamicOffsets.
+			// Firefox's WebIDL bindings reject ArrayBufferView >2GB (bug 1838218), even with offset/length.
+			// This workaround creates a proper slice of just the needed offsets.
+			// Track fix status: https://bugzilla.mozilla.org/show_bug.cgi?id=1838218
+			// TODO: Remove this workaround when Firefox ships the fix (update FIREFOX_FIXED_VERSION)
+			var FIREFOX_FIXED_VERSION = 999; // Replace with actual version when bug 1838218 is fixed
+			var firefoxVersion = (function() {
+				var match = navigator.userAgent.match(/Firefox\/(\d+)/);
+				return match ? parseInt(match[1], 10) : 0;
+			})();
+			if( navigator.gpu && firefoxVersion > 0 && firefoxVersion < FIREFOX_FIXED_VERSION ) {
+				console.log('MWAtlas: Applying Firefox WebGPU setBindGroup workaround (v' + firefoxVersion + ' < ' + FIREFOX_FIXED_VERSION + ')');
+				
+				function patchSetBindGroup(ctor, name) {
+					if( !ctor || !ctor.prototype || !ctor.prototype.setBindGroup ) return;
+					var orig = ctor.prototype.setBindGroup;
+					ctor.prototype.setBindGroup = function(index, bindGroup, dynamicOffsets, dynamicOffsetsStart, dynamicOffsetsLength) {
+						// If large view is passed with offset/length, create a proper slice
+						if( dynamicOffsets && dynamicOffsetsStart !== undefined && dynamicOffsetsLength !== undefined ) {
+							if( dynamicOffsets.byteLength > 1024 * 1024 ) {
+								// Create a small Uint32Array with just the needed values
+								var sliced = new Uint32Array( dynamicOffsetsLength );
+								for( var i = 0; i < dynamicOffsetsLength; i++ ) {
+									sliced[ i ] = dynamicOffsets[ dynamicOffsetsStart + i ];
+								}
+								// Call with the sliced array (no offset needed now)
+								return orig.call( this, index, bindGroup, sliced );
+							}
+						}
+						return orig.apply( this, arguments );
+					};
+				}
+				
+				if( typeof GPURenderPassEncoder !== 'undefined' ) {
+					patchSetBindGroup( GPURenderPassEncoder, 'Render' );
+				}
+				if( typeof GPUComputePassEncoder !== 'undefined' ) {
+					patchSetBindGroup( GPUComputePassEncoder, 'Compute' );
+				}
+			}
+
+			var script = document.createElement('script');
+			script.src = "MWAtlas.js";
+			script.onload = function() {
+				console.log("Emscripten boilerplate loaded.");
+			}
+			document.body.appendChild(script);
+
+			// When you click outside the canvas on itch.io input stops working, this fixes it
+			Module.canvas.onclick = function() {
+				Module.canvas.focus();
+			}
+		})
+		.catch(function(err) {
+			console.error("Failed to load WASM:", err);
+			document.getElementById('progress-text').innerText = 'Error: ' + err.message;
+			document.getElementById('progress-bar').style.background = '#f44336';
+		});
+
+		Module.setStatus = function(text) {
+			console.log('status:', text);
+			if( !text || text === 'Running...' ) {
+				document.getElementById('progress-text').innerText = 'Initializing...';
+			} else {
+				document.getElementById('progress-text').innerText = text;
+			}
+		};
+
+		Module.monitorRunDependencies = function(left) {
+			if( left === 0 )
+				document.getElementById('progress-text').innerText = 'Initializing...';
+		};
+	</script>
+</body>
+</html>
