@@ -93,6 +93,7 @@
 	</div>
 	<canvas id="canvas" tabindex="0"></canvas>
 
+	<script src="isolation.js"></script>
 	<script type='text/javascript'>
 
 		function formatBytes(bytes) {
@@ -109,7 +110,9 @@
 		};
 
 		// Fetch WASM with progress tracking (collects chunks, avoids Content-Length issues)
-		fetch('MWAtlas.wasm')
+		MWAtlasIsolationReady.then(function() {
+			return fetch('MWAtlas.wasm');
+		})
 		.then(function(response) {
 			// Extract build date from Last-Modified header
 			var lastModified = response.headers.get('Last-Modified');
