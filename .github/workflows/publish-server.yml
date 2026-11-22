@@ -1,0 +1,121 @@
+name: Publish MWAtlas Server
+run-name: ${{ inputs.release_tag || github.event.head_commit.message }}
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release containing endpoint.txt and the game BIN/ZIP files
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: mwatlas-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Download and validate deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            RELEASE_TAG=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/publish-server.yml/runs?branch=main&event=workflow_dispatch&status=success&per_page=100" \
+              --jq '.workflow_runs[] | .display_title | select(test("^mwatlas-pages-[0-9a-f]{32}$"))' | sed -n '1p')
+            if [[ -z "$RELEASE_TAG" ]]; then
+              echo 'No successful server publication yet. Publish the server to initialize Pages.' >&2
+              exit 1
+            fi
+          fi
+          [[ "$RELEASE_TAG" =~ ^mwatlas-pages-[0-9a-f]{32}$ ]]
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern endpoint.txt --pattern '*.bin' --pattern '*.zip' --dir _publish
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import shutil
+          import struct
+          import urllib.parse
+          import zipfile
+
+          source = pathlib.Path("_publish")
+          endpoint = (source / "endpoint.txt").read_text(encoding="utf-8").splitlines()
+          if len(endpoint) != 4 or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", endpoint[0]):
+              raise SystemExit("Invalid endpoint text")
+          game, websocket, bundle_url, size = endpoint
+          bundle = source / f"{game}.bin"
+          archive = source / f"{game}.zip"
+          if not re.fullmatch(r"[0-9]{1,9}", size) or int(size) != bundle.stat().st_size or not 12 <= int(size) <= 128 * 1024 * 1024:
+              raise SystemExit("Invalid bundle size")
+          if urllib.parse.urlsplit(websocket).scheme != "wss":
+              raise SystemExit("Gameplay must use WSS")
+          if bundle_url != f"https://schlabbermampf.github.io/data/Compute/{game}.bin":
+              raise SystemExit("Unexpected bundle URL")
+          if not zipfile.is_zipfile(archive):
+              raise SystemExit("Invalid source game archive")
+          data = bundle.read_bytes()
+          magic, version, count = struct.unpack_from("<III", data)
+          if magic != 0x4243574D or version != 1 or not 1 <= count <= 4096:
+              raise SystemExit("Invalid bundle header")
+          offset = 12
+          paths = set()
+          for _ in range(count):
+              if offset + 2 > len(data):
+                  raise SystemExit("Truncated bundle path")
+              length, = struct.unpack_from("<H", data, offset)
+              offset += 2
+              if not 1 <= length <= 4096 or offset + length + 4 > len(data):
+                  raise SystemExit("Invalid bundle path length")
+              path = data[offset:offset + length].decode("utf-8")
+              offset += length
+              if path in paths or any(ord(char) < 32 or char in "\\:" for char in path) or any(part in {"", ".", ".."} for part in path.split("/")):
+                  raise SystemExit("Invalid or duplicate bundle path")
+              if path != "client.auto" and not path.startswith("Models/"):
+                  raise SystemExit("Unexpected bundle file")
+              paths.add(path)
+              length, = struct.unpack_from("<I", data, offset)
+              offset += 4
+              if length == 0 or offset + length > len(data):
+                  raise SystemExit("Invalid bundle file size")
+              offset += length
+          if offset != len(data) or not {"client.auto", "Models/auto.wgsh", "Models/common.wgsh"}.issubset(paths):
+              raise SystemExit("Client bundle has trailing bytes or missing required files")
+          site = pathlib.Path("_site")
+          site.mkdir()
+          for entry in pathlib.Path(".").iterdir():
+              if entry.name in {".git", ".github", "_publish", "_site", "endpoint.json", "client.bundle", "endpoint.txt", "client.zip", "client.bin"}:
+                  continue
+              if entry.is_dir():
+                  shutil.copytree(entry, site / entry.name)
+              elif entry.is_file():
+                  shutil.copy2(entry, site / entry.name)
+          shutil.copy2(source / "endpoint.txt", site / "endpoint.txt")
+          compute = site / "data" / "Compute"
+          compute.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(bundle, compute / bundle.name)
+          shutil.copy2(archive, compute / archive.name)
+          if sum(entry.stat().st_size for entry in site.rglob("*") if entry.is_file()) > 1024 ** 3:
+              raise SystemExit("Published site exceeds the GitHub Pages 1 GB limit")
+          PY
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
